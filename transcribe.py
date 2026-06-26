@@ -162,7 +162,7 @@ def detect_instruments(filename, text):
 
 
 def content_hash(text):
-    """SHA-256 of the transcript text, for idempotent downstream ingestion."""
+    """SHA-256 of the given text (prefixed 'sha256:'), for idempotent ingestion."""
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -197,6 +197,21 @@ def format_segments(segments):
     dropped by any later formatting pass.
     """
     return "\n".join(f"[{seconds_to_hms(start)}] {text}" for start, text in segments)
+
+
+def strip_timestamps(body):
+    """Return just the spoken words from a transcript body: drop the leading
+    [HH:MM:SS] markers and collapse all whitespace to single spaces.
+
+    content_sha256 is hashed over THIS, not the timestamped text, so a
+    re-transcription with slightly shifted timestamps or different segment
+    boundaries still yields the same hash (identical speech -> identical hash),
+    and the downstream pipeline won't mistake it for a brand-new transcript.
+    Downstream can reproduce the hash from a saved file by applying these same
+    two steps to the body (the part after the YAML header).
+    """
+    no_marks = re.sub(r"(?m)^\[\d{2,}:\d{2}:\d{2}\]\s*", "", body)
+    return re.sub(r"\s+", " ", no_marks).strip()
 
 
 def check_ffmpeg():
@@ -439,7 +454,7 @@ def main():
             "original_filename": video.name,
             "duration": seconds_to_hms(duration),
             "instruments": detect_instruments(video.name, body),
-            "content_sha256": content_hash(body),
+            "content_sha256": content_hash(strip_timestamps(body)),
             "author": args.author,
             "model": args.model,
             "language": getattr(info, "language", "") or "",

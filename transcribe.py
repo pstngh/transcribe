@@ -177,9 +177,9 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="medium",
+        default="large-v3",
         choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
-        help="Whisper model size (default: medium)",
+        help="Whisper model size (default: large-v3, highest accuracy)",
     )
     parser.add_argument(
         "--language",

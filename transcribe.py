@@ -1,8 +1,13 @@
 """
-Batch transcribe MP4/MKV files to a single TXT using faster-whisper
+Batch transcribe MP4/MKV files using faster-whisper.
+
+Scans the given folder (and all subfolders) for video files and writes one
+TXT file per video. Each TXT is named after the original video and all of
+them are placed together in a single output folder.
 
 Usage:
     python transcribe.py /path/to/your/videos
+    python transcribe.py /path/to/your/videos --output-dir /path/to/output
     python transcribe.py /path/to/your/videos --model large-v3
     python transcribe.py /path/to/your/videos --model small --language auto
 """
@@ -93,7 +98,14 @@ def main():
         "folder",
         nargs="?",
         default=".",
-        help="Folder containing video files (default: current directory)",
+        help="Folder containing video files, scanned recursively "
+             "(default: current directory)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Folder to write the .txt transcripts into "
+             "(default: a 'transcriptions' folder inside the input folder)",
     )
     parser.add_argument(
         "--model",
@@ -113,9 +125,13 @@ def main():
         print(f"Error: folder '{folder}' not found")
         sys.exit(1)
 
+    # All transcripts go into a single output folder.
+    output_dir = Path(args.output_dir) if args.output_dir else folder / "transcriptions"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     check_ffmpeg()
 
-    # Find all MP4 and MKV files
+    # Find all MP4 and MKV files, including those in subfolders.
     video_files = sorted(folder.rglob("*.mp4")) + sorted(folder.rglob("*.mkv"))
     if not video_files:
         print(f"No .mp4 or .mkv files found in {folder}")
@@ -126,34 +142,41 @@ def main():
 
     model = WhisperModel(args.model, device="cpu", compute_type="int8")
 
-    output_file = folder / "transcriptions.txt"
     succeeded = 0
     failed = []
+    used_names = set()
 
-    with open(output_file, "w", encoding="utf-8") as f:
-        for idx, video in enumerate(video_files):
-            relative_path = video.relative_to(folder)
-            try:
-                text = transcribe_video(model, video, args.language)
-            except Exception as e:
-                print(f"  ERROR on {relative_path}: {e}")
-                failed.append(relative_path)
-                continue
+    for video in video_files:
+        relative_path = video.relative_to(folder)
+        try:
+            text = transcribe_video(model, video, args.language)
+        except Exception as e:
+            print(f"  ERROR on {relative_path}: {e}")
+            failed.append(relative_path)
+            continue
 
-            if succeeded > 0:
-                f.write("\n\n")
-            f.write("=" * 80 + "\n")
-            f.write(f"FILE: {relative_path}\n")
-            f.write("=" * 80 + "\n\n")
+        # Name the .txt after the original video. If two videos in different
+        # subfolders share a name, add a numeric suffix so nothing is overwritten.
+        out_name = video.stem + ".txt"
+        if out_name.lower() in used_names:
+            n = 1
+            while f"{video.stem}_{n}.txt".lower() in used_names:
+                n += 1
+            out_name = f"{video.stem}_{n}.txt"
+        used_names.add(out_name.lower())
+
+        out_path = output_dir / out_name
+        with open(out_path, "w", encoding="utf-8") as f:
             f.write(text + "\n")
-            succeeded += 1
+        print(f"  Saved: {out_path}")
+        succeeded += 1
 
     print(f"\n--- Done! {succeeded}/{len(video_files)} files transcribed ---")
     if failed:
         print(f"Failed ({len(failed)}):")
         for name in failed:
             print(f"  - {name}")
-    print(f"Output: {output_file}")
+    print(f"Output folder: {output_dir}")
 
 
 if __name__ == "__main__":

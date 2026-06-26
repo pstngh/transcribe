@@ -2,28 +2,40 @@
 Batch transcribe MP4/MKV files using faster-whisper.
 
 Scans the given folder (and all subfolders) for video files and writes one
-TXT file per video. Each TXT is named after the original video and all of
-them are placed together in a single output folder.
+TXT file per video into a single output folder. Each transcript is written
+for a downstream pipeline and contains:
 
-A small tracking file records which videos have already been transcribed, so
-you can drop new videos into the folder over time and re-run to transcribe
-only the new ones. Use --force to re-transcribe everything.
+  * a parseable YAML front-matter header (source_date, video_type, title,
+    duration, instruments, content hash, ...), and
+  * one line per segment, each prefixed with an [HH:MM:SS] start timestamp.
+
+Output files follow a sortable convention:
+    YYYY-MM-DD_<author>_<daily-plan|live-stream>_<shorttitle>.txt
+
+A tracking file records which videos have already been transcribed, so you
+can drop new videos into the folder over time and re-run to transcribe only
+the new ones. Existing output files are also detected, so the batch is
+resumable even if the tracking file is lost. Use --force to redo everything.
 
 Usage:
     python transcribe.py /path/to/your/videos
+    python transcribe.py /path/to/videos --video-type daily_plan
+    python transcribe.py /path/to/videos --video-type live_stream
+    python transcribe.py /path/to/videos --source-date 2024-03-15   # single file
     python transcribe.py /path/to/your/videos --output-dir /path/to/output
     python transcribe.py /path/to/your/videos --force
-    python transcribe.py /path/to/your/videos --model large-v3
     python transcribe.py /path/to/your/videos --model small --language auto
 """
 
+import re
 import sys
 import os
 import json
+import hashlib
 import argparse
 import subprocess
 import tempfile
-from datetime import datetime
+from datetime import datetime, date as _date
 from pathlib import Path
 from faster_whisper import WhisperModel
 
@@ -67,15 +79,153 @@ def is_unchanged(record, size, mtime):
     return record.get("size") == size and abs(record.get("mtime", 0) - mtime) < 1.0
 
 
-def unique_output_name(stem, output_dir, used_names):
-    """Pick a '<stem>.txt' name that doesn't collide with an already-used name
-    or an existing file on disk, adding a numeric suffix if needed."""
+def unique_output_name(base_name, output_dir, used_names):
+    """Pick a '<base>.txt' name that doesn't collide with an already-used name
+    or an existing file on disk, adding a numeric suffix if needed.
+
+    Accepts either a bare stem or a full '<name>.txt' base name.
+    """
+    stem = base_name[:-4] if base_name.lower().endswith(".txt") else base_name
     candidate = stem + ".txt"
     n = 1
     while candidate.lower() in used_names or (output_dir / candidate).exists():
         candidate = f"{stem}_{n}.txt"
         n += 1
     return candidate
+
+
+# Canonical video types and their hyphenated forms used in filenames.
+VIDEO_TYPES = {"daily_plan": "daily-plan", "live_stream": "live-stream"}
+
+
+def seconds_to_hms(seconds):
+    """Format a number of seconds as a zero-padded HH:MM:SS string."""
+    total = int(seconds or 0)
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def slugify(text):
+    """Lowercase, ASCII, hyphen-separated slug suitable for filenames."""
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    return re.sub(r"-+", "-", text).strip("-")
+
+
+def _valid_ymd(y, m, d):
+    try:
+        _date(int(y), int(m), int(d))
+        return True
+    except ValueError:
+        return False
+
+
+def extract_date_from_name(name):
+    """Best-effort extraction of an original recording date (YYYY-MM-DD) from a
+    filename. Tries ISO-like, compact, then US ordering. Returns None if none."""
+    # ISO-like: 2024-03-15, 2024_03_15, 2024.03.15
+    m = re.search(r"(?<!\d)(20\d{2})[-_.](\d{1,2})[-_.](\d{1,2})(?!\d)", name)
+    if m and _valid_ymd(*m.groups()):
+        y, mo, d = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    # Compact: 20240315
+    m = re.search(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)", name)
+    if m and _valid_ymd(*m.groups()):
+        y, mo, d = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    # US: 03-15-2024, 03_15_2024
+    m = re.search(r"(?<!\d)(\d{1,2})[-_.](\d{1,2})[-_.](20\d{2})(?!\d)", name)
+    if m:
+        mo, d, y = m.groups()
+        if _valid_ymd(y, mo, d):
+            return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+    return None
+
+
+def infer_video_type(name):
+    """Infer 'daily_plan' or 'live_stream' from a filename, or None."""
+    low = name.lower()
+    if any(k in low for k in ("live", "stream")):
+        return "live_stream"
+    if any(k in low for k in ("daily", "plan", "premarket", "pre-market")):
+        return "daily_plan"
+    return None
+
+
+def detect_instruments(filename, text):
+    """Detect traded instruments (ES / NQ) from the filename or transcript.
+
+    Conservative: only matches uppercase tickers as whole words, plus common
+    synonyms. Returns 'ES', 'NQ', 'ES, NQ', or '' when undeterminable.
+    """
+    found = []
+    if (re.search(r"\bES\b", filename) or re.search(r"\bES\b", text)
+            or re.search(r"\bE-?mini\b", text, re.I)
+            or re.search(r"S\s*&\s*P|S and P", text, re.I)):
+        found.append("ES")
+    if (re.search(r"\bNQ\b", filename) or re.search(r"\bNQ\b", text)
+            or re.search(r"nasdaq", text, re.I)):
+        found.append("NQ")
+    return ", ".join(found)
+
+
+def make_short_title(stem, source_date):
+    """Build a short, sortable slug from the original filename, dropping the
+    date and type/author keywords so the final filename isn't redundant."""
+    slug = slugify(stem)
+    if source_date:
+        slug = slug.replace(source_date, "").replace(source_date.replace("-", ""), "")
+    for kw in ("daily-plan", "daily", "plan", "live-stream", "livestream",
+               "live", "stream", "premarket", "pre-market", "severin"):
+        slug = re.sub(rf"(?:^|-){re.escape(kw)}(?=-|$)", "", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    slug = slug[:40].strip("-")
+    return slug or "untitled"
+
+
+def build_output_filename(source_date, author, video_type, short_title):
+    """Compose the sortable output filename for a transcript."""
+    type_slug = VIDEO_TYPES.get(video_type, slugify(video_type))
+    return f"{source_date}_{slugify(author)}_{type_slug}_{short_title}.txt"
+
+
+def content_hash(text):
+    """SHA-256 of the transcript text, for idempotent downstream ingestion."""
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def yaml_quote(value):
+    """Double-quote and escape a value so the header is unambiguous YAML; every
+    field is emitted as a string for predictable parsing across the pipeline."""
+    s = "" if value is None else str(value)
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# Header field order is fixed so downstream parsing is stable.
+HEADER_FIELDS = [
+    "source_date", "video_type", "title", "original_filename", "duration",
+    "instruments", "content_sha256", "author", "model", "language",
+    "transcribed_at",
+]
+
+
+def build_header(meta):
+    """Render the metadata dict as a YAML front-matter block."""
+    lines = ["---"]
+    for key in HEADER_FIELDS:
+        lines.append(f"{key}: {yaml_quote(meta.get(key, ''))}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+def format_segments(segments):
+    """One line per segment, each prefixed with its [HH:MM:SS] start time.
+
+    This is the single place segments become text, so the timestamps cannot be
+    dropped by any later formatting pass.
+    """
+    return "\n".join(f"[{seconds_to_hms(start)}] {text}" for start, text in segments)
 
 
 def check_ffmpeg():
@@ -112,7 +262,12 @@ def extract_audio(input_file):
 
 
 def transcribe_video(model, input_file, language):
-    """Transcribe a single file and return the text."""
+    """Transcribe a single file.
+
+    Returns (segments, info) where segments is a list of (start_seconds, text)
+    tuples. Per-segment start times are kept so the writer can emit [HH:MM:SS]
+    markers; the engine/quality settings below are unchanged.
+    """
     print(f"\nTranscribing: {input_file}")
 
     tmp_path = extract_audio(input_file)
@@ -134,15 +289,16 @@ def transcribe_video(model, input_file, language):
             f"(probability {info.language_probability:.2f})"
         )
 
-        i = 0
-        text_parts = []
+        results = []
         for i, segment in enumerate(segments, 1):
-            text_parts.append(segment.text.strip())
+            text = segment.text.strip()
+            if text:
+                results.append((segment.start, text))
             if i % 50 == 0:
                 print(f"  ...{i} segments done")
 
-        print(f"  Finished! {i} segment(s) written.")
-        return " ".join(text_parts)
+        print(f"  Finished! {len(results)} segment(s).")
+        return results, info
     finally:
         os.unlink(tmp_path)
 
@@ -169,6 +325,25 @@ def main():
         default=None,
         help="JSON file recording which videos are already transcribed "
              "(default: '.transcribed.json' inside the output folder)",
+    )
+    parser.add_argument(
+        "--video-type",
+        choices=["daily_plan", "live_stream"],
+        default=None,
+        help="Video type for all files this run. If omitted, it is inferred "
+             "from each filename (falling back to daily_plan).",
+    )
+    parser.add_argument(
+        "--source-date",
+        default=None,
+        help="Original recording date YYYY-MM-DD applied to all files this "
+             "run (intended for single-file runs). If omitted, the date is "
+             "taken from each filename, falling back to the file's mod/time.",
+    )
+    parser.add_argument(
+        "--author",
+        default="severin",
+        help="Author/source tag used in the output filename (default: severin)",
     )
     parser.add_argument(
         "--force",
@@ -206,6 +381,12 @@ def main():
         sys.exit(1)
 
     print(f"Found {len(video_files)} video file(s)")
+
+    # Validate an explicit --source-date up front (it applies to all files).
+    if args.source_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.source_date):
+        print(f"Error: --source-date must be YYYY-MM-DD, got '{args.source_date}'")
+        sys.exit(1)
+
     # Load tracking so we transcribe only videos we haven't done before.
     tracking_file = (
         Path(args.tracking_file) if args.tracking_file
@@ -232,10 +413,32 @@ def main():
         size, mtime = file_signature(video)
         record = processed.get(key)
 
-        # Skip videos already transcribed that haven't changed since.
-        if record and not args.force and is_unchanged(record, size, mtime):
-            skipped += 1
-            continue
+        # Resolve metadata that doesn't need the transcript first, so we can
+        # build the target filename and decide whether to skip before doing the
+        # expensive transcription.
+        source_date = args.source_date or extract_date_from_name(video.name)
+        if not source_date:
+            source_date = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+            print(f"  WARNING: no date found in '{video.name}'; using file date "
+                  f"{source_date}. Pass --source-date or put a date in the "
+                  f"filename for correct chronological ordering downstream.")
+
+        video_type = args.video_type or infer_video_type(video.name) or "daily_plan"
+        short_title = make_short_title(video.stem, source_date)
+        target_name = build_output_filename(
+            source_date, args.author, video_type, short_title
+        )
+
+        # Resumable + idempotent: skip if this source video is already tracked
+        # and unchanged, or if its target transcript already exists on disk.
+        if not args.force:
+            if record and is_unchanged(record, size, mtime):
+                skipped += 1
+                continue
+            if (output_dir / target_name).exists():
+                print(f"  Skipping {relative_path}: '{target_name}' already exists.")
+                skipped += 1
+                continue
 
         if model is None:
             print(f"Loading model '{args.model}' "
@@ -243,23 +446,44 @@ def main():
             model = WhisperModel(args.model, device="cpu", compute_type="int8")
 
         try:
-            text = transcribe_video(model, video, args.language)
+            segments, info = transcribe_video(model, video, args.language)
         except Exception as e:
             print(f"  ERROR on {relative_path}: {e}")
             failed.append(relative_path)
             continue
 
-        # Re-transcribing a known file reuses its name (overwrites in place);
-        # a new file gets a fresh, collision-free '<original name>.txt'.
+        # Build the timestamped body first, then wrap the metadata header around
+        # it. Timestamps live in the body and are never stripped afterwards.
+        body = format_segments(segments)
+        duration = info.duration if getattr(info, "duration", None) else (
+            segments[-1][0] if segments else 0
+        )
+        meta = {
+            "source_date": source_date,
+            "video_type": video_type,
+            "title": video.stem,
+            "original_filename": video.name,
+            "duration": seconds_to_hms(duration),
+            "instruments": detect_instruments(video.name, body),
+            "content_sha256": content_hash(body),
+            "author": args.author,
+            "model": args.model,
+            "language": getattr(info, "language", "") or "",
+            "transcribed_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        content = build_header(meta) + "\n\n" + body + "\n"
+
+        # Re-transcribing a known file overwrites it in place; a new file gets a
+        # fresh, collision-free name following the sortable convention.
         if record and record.get("output"):
             out_name = record["output"]
         else:
-            out_name = unique_output_name(video.stem, output_dir, used_names)
+            out_name = unique_output_name(target_name, output_dir, used_names)
             used_names.add(out_name.lower())
 
         out_path = output_dir / out_name
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
+            f.write(content)
         print(f"  Saved: {out_path}")
 
         # Record progress immediately so an interrupted run resumes cleanly.
@@ -267,7 +491,10 @@ def main():
             "output": out_name,
             "size": size,
             "mtime": mtime,
-            "transcribed_at": datetime.now().isoformat(timespec="seconds"),
+            "source_date": source_date,
+            "video_type": video_type,
+            "content_sha256": meta["content_sha256"],
+            "transcribed_at": meta["transcribed_at"],
         }
         save_tracking(tracking_file, processed)
         transcribed += 1

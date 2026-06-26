@@ -2,15 +2,16 @@
 Batch transcribe MP4/MKV files using faster-whisper.
 
 Scans the given folder (and all subfolders) for video files and writes one
-TXT file per video into a single output folder. Each transcript is written
-for a downstream pipeline and contains:
+TXT file per video into a single output folder. Each transcript is named
+after the original video (e.g. "my clip.mp4" -> "my clip.txt") and is written
+for a downstream pipeline, containing:
 
   * a parseable YAML front-matter header (source_date, video_type, title,
     duration, instruments, content hash, ...), and
   * one line per segment, each prefixed with an [HH:MM:SS] start timestamp.
 
-Output files follow a sortable convention:
-    YYYY-MM-DD_<author>_<daily-plan|live-stream>_<shorttitle>.txt
+The chronological/type metadata the pipeline needs lives in the header, so
+the filename can stay a simple, recognizable match to the source video.
 
 A tracking file records which videos have already been transcribed, so you
 can drop new videos into the folder over time and re-run to transcribe only
@@ -35,6 +36,7 @@ import hashlib
 import argparse
 import subprocess
 import tempfile
+from collections import Counter
 from datetime import datetime, date as _date
 from pathlib import Path
 from faster_whisper import WhisperModel
@@ -94,23 +96,12 @@ def unique_output_name(base_name, output_dir, used_names):
     return candidate
 
 
-# Canonical video types and their hyphenated forms used in filenames.
-VIDEO_TYPES = {"daily_plan": "daily-plan", "live_stream": "live-stream"}
-
-
 def seconds_to_hms(seconds):
     """Format a number of seconds as a zero-padded HH:MM:SS string."""
     total = int(seconds or 0)
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def slugify(text):
-    """Lowercase, ASCII, hyphen-separated slug suitable for filenames."""
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    return re.sub(r"-+", "-", text).strip("-")
 
 
 def _valid_ymd(y, m, d):
@@ -168,26 +159,6 @@ def detect_instruments(filename, text):
             or re.search(r"nasdaq", text, re.I)):
         found.append("NQ")
     return ", ".join(found)
-
-
-def make_short_title(stem, source_date):
-    """Build a short, sortable slug from the original filename, dropping the
-    date and type/author keywords so the final filename isn't redundant."""
-    slug = slugify(stem)
-    if source_date:
-        slug = slug.replace(source_date, "").replace(source_date.replace("-", ""), "")
-    for kw in ("daily-plan", "daily", "plan", "live-stream", "livestream",
-               "live", "stream", "premarket", "pre-market", "severin"):
-        slug = re.sub(rf"(?:^|-){re.escape(kw)}(?=-|$)", "", slug)
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    slug = slug[:40].strip("-")
-    return slug or "untitled"
-
-
-def build_output_filename(source_date, author, video_type, short_title):
-    """Compose the sortable output filename for a transcript."""
-    type_slug = VIDEO_TYPES.get(video_type, slugify(video_type))
-    return f"{source_date}_{slugify(author)}_{type_slug}_{short_title}.txt"
 
 
 def content_hash(text):
@@ -343,7 +314,7 @@ def main():
     parser.add_argument(
         "--author",
         default="severin",
-        help="Author/source tag used in the output filename (default: severin)",
+        help="Author/source tag recorded in each file's header (default: severin)",
     )
     parser.add_argument(
         "--force",
@@ -402,6 +373,10 @@ def main():
         if isinstance(rec, dict) and rec.get("output")
     }
 
+    # Count duplicate stems so we know when an existing "<stem>.txt" on disk
+    # unambiguously belongs to this exact video (used for crash recovery below).
+    stem_counts = Counter(v.stem.lower() for v in video_files)
+
     model = None  # loaded lazily, only if there is actually new work to do
     transcribed = 0
     skipped = 0
@@ -413,30 +388,18 @@ def main():
         size, mtime = file_signature(video)
         record = processed.get(key)
 
-        # Resolve metadata that doesn't need the transcript first, so we can
-        # build the target filename and decide whether to skip before doing the
-        # expensive transcription.
-        source_date = args.source_date or extract_date_from_name(video.name)
-        if not source_date:
-            source_date = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
-            print(f"  WARNING: no date found in '{video.name}'; using file date "
-                  f"{source_date}. Pass --source-date or put a date in the "
-                  f"filename for correct chronological ordering downstream.")
-
-        video_type = args.video_type or infer_video_type(video.name) or "daily_plan"
-        short_title = make_short_title(video.stem, source_date)
-        target_name = build_output_filename(
-            source_date, args.author, video_type, short_title
-        )
-
-        # Resumable + idempotent: skip if this source video is already tracked
-        # and unchanged, or if its target transcript already exists on disk.
+        # Resumable + idempotent. The primary signal is the tracking file, keyed
+        # by source path, so it's never confused by two videos sharing a name.
+        # As a fallback when the tracking file is lost, treat an existing
+        # "<original name>.txt" as done -- but only when that stem is unique, so
+        # we can't wrongly skip a different video that happens to share its name.
         if not args.force:
             if record and is_unchanged(record, size, mtime):
                 skipped += 1
                 continue
-            if (output_dir / target_name).exists():
-                print(f"  Skipping {relative_path}: '{target_name}' already exists.")
+            if (stem_counts[video.stem.lower()] == 1
+                    and (output_dir / (video.stem + ".txt")).exists()):
+                print(f"  Skipping {relative_path}: '{video.stem}.txt' already exists.")
                 skipped += 1
                 continue
 
@@ -451,6 +414,17 @@ def main():
             print(f"  ERROR on {relative_path}: {e}")
             failed.append(relative_path)
             continue
+
+        # Resolve the header metadata. source_date is the ORIGINAL recording
+        # date -- from the filename or --source-date, falling back to the file's
+        # modified time -- and is never the transcription date.
+        source_date = args.source_date or extract_date_from_name(video.name)
+        if not source_date:
+            source_date = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+            print(f"  WARNING: no date found in '{video.name}'; using file date "
+                  f"{source_date}. Pass --source-date or put a date in the "
+                  f"filename for correct chronological ordering downstream.")
+        video_type = args.video_type or infer_video_type(video.name) or "daily_plan"
 
         # Build the timestamped body first, then wrap the metadata header around
         # it. Timestamps live in the body and are never stripped afterwards.
@@ -473,12 +447,20 @@ def main():
         }
         content = build_header(meta) + "\n\n" + body + "\n"
 
-        # Re-transcribing a known file overwrites it in place; a new file gets a
-        # fresh, collision-free name following the sortable convention.
+        # Name the .txt after the original video. A known file (in the tracking
+        # record) is overwritten in place. With no record but a uniquely-named
+        # transcript already on disk, overwrite that too -- it's this video's
+        # (this is the --force path; without --force it was skipped above). Only
+        # a genuine same-name clash from another subfolder gets a numeric
+        # suffix, so nothing is ever silently overwritten.
         if record and record.get("output"):
             out_name = record["output"]
+        elif (stem_counts[video.stem.lower()] == 1
+                and (output_dir / (video.stem + ".txt")).exists()):
+            out_name = video.stem + ".txt"
+            used_names.add(out_name.lower())
         else:
-            out_name = unique_output_name(target_name, output_dir, used_names)
+            out_name = unique_output_name(video.stem, output_dir, used_names)
             used_names.add(out_name.lower())
 
         out_path = output_dir / out_name

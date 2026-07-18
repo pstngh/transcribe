@@ -1,5 +1,5 @@
 """
-Batch transcribe MP4/MKV files using faster-whisper.
+Batch transcribe MP4/MKV/FLV files using faster-whisper.
 
 Scans the given folder (and all subfolders) for video files and writes one
 TXT file per video into a single output folder. Each transcript is named
@@ -40,6 +40,10 @@ from collections import Counter
 from datetime import datetime, date as _date
 from pathlib import Path
 from faster_whisper import WhisperModel
+
+
+# Video containers we transcribe, matched case-insensitively. Add more here.
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".flv"}
 
 
 def load_tracking(path):
@@ -291,7 +295,7 @@ def transcribe_video(model, input_file, language):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Batch transcribe MP4/MKV files using faster-whisper"
+        description="Batch transcribe MP4/MKV/FLV files using faster-whisper"
     )
     parser.add_argument(
         "folder",
@@ -360,10 +364,14 @@ def main():
 
     check_ffmpeg()
 
-    # Find all MP4 and MKV files, including those in subfolders.
-    video_files = sorted(folder.rglob("*.mp4")) + sorted(folder.rglob("*.mkv"))
+    # Find all supported video files, including those in subfolders.
+    video_files = sorted(
+        p for p in folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
+    )
     if not video_files:
-        print(f"No .mp4 or .mkv files found in {folder}")
+        exts = ", ".join(sorted(VIDEO_EXTENSIONS))
+        print(f"No video files ({exts}) found in {folder}")
         sys.exit(1)
 
     print(f"Found {len(video_files)} video file(s)")
